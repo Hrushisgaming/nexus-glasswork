@@ -33,8 +33,8 @@ env:
   GH_TOKEN: ${{ github.token }}
   WORKFLOW_FILE: build-macos.yml
   GLASSWORK: ${{ inputs.glasswork_plugins || 'on' }}
-  # The upstream LMMS commit that glasswork-overlay.zip was made against. The overlay replaces whole files,
-  # so the build switches to this commit first; that keeps newer upstream changes from clashing with it.
+  # The upstream LMMS commit that glasswork-overlay.zip was made against. Every job downloads LMMS at exactly
+  # this commit (no fork needed) and lays the overlay on top, so newer upstream changes can't clash with it.
   GLASSWORK_BASE: 4fde529fb37115c327daadac8506870e92724f3a
 
 jobs:
@@ -78,7 +78,6 @@ jobs:
           echo "nshards=$n"   >> "$GITHUB_OUTPUT"
           echo "budget=$budget" >> "$GITHUB_OUTPUT"
           echo "round=$round" >> "$GITHUB_OUTPUT"
-
   # ------------------------------------------------------------------ core (must finish first: every plugin links against it)
   core:
     needs: plan
@@ -90,23 +89,18 @@ jobs:
     runs-on: ${{ matrix.a.runner }}
     timeout-minutes: 345
     steps:
-      - uses: actions/checkout@v7
-        with: { fetch-depth: 0, submodules: recursive }
+      - name: Get LMMS source (pinned commit)
+        uses: actions/checkout@v7
+        with: { repository: LMMS/lmms, ref: "${{ env.GLASSWORK_BASE }}", fetch-depth: 0, submodules: recursive }
+      - name: Get Glasswork overlay (this repo)
+        uses: actions/checkout@v7
+        with: { path: self, fetch-depth: 1 }
       - name: Apply Glasswork overlay
         shell: bash
         run: |
-          if [ -f glasswork-overlay.zip ]; then
-            cp glasswork-overlay.zip "$RUNNER_TEMP/overlay.zip"
-            if git cat-file -e "$GLASSWORK_BASE^{commit}" 2>/dev/null; then
-              git checkout -q "$GLASSWORK_BASE" && git submodule update --init --recursive -q
-            else
-              echo "::warning::pinned LMMS commit not found in this repo; building the current commit instead"
-            fi
-            unzip -oq "$RUNNER_TEMP/overlay.zip" -x '.github/workflows/*'
-            echo "Glasswork overlay applied"
-          else
-            echo "::warning::glasswork-overlay.zip not found; building the repository as it is"
-          fi
+          unzip -oq self/glasswork-overlay.zip -x '.github/workflows/*'
+          chmod +x ci/*.sh
+          echo "Glasswork overlay applied"
       - uses: ./.github/actions/prep
         with:
           arch: ${{ matrix.a.arch }}
@@ -141,23 +135,18 @@ jobs:
     runs-on: ${{ matrix.a.runner }}
     timeout-minutes: 345
     steps:
-      - uses: actions/checkout@v7
-        with: { fetch-depth: 0, submodules: recursive }
+      - name: Get LMMS source (pinned commit)
+        uses: actions/checkout@v7
+        with: { repository: LMMS/lmms, ref: "${{ env.GLASSWORK_BASE }}", fetch-depth: 0, submodules: recursive }
+      - name: Get Glasswork overlay (this repo)
+        uses: actions/checkout@v7
+        with: { path: self, fetch-depth: 1 }
       - name: Apply Glasswork overlay
         shell: bash
         run: |
-          if [ -f glasswork-overlay.zip ]; then
-            cp glasswork-overlay.zip "$RUNNER_TEMP/overlay.zip"
-            if git cat-file -e "$GLASSWORK_BASE^{commit}" 2>/dev/null; then
-              git checkout -q "$GLASSWORK_BASE" && git submodule update --init --recursive -q
-            else
-              echo "::warning::pinned LMMS commit not found in this repo; building the current commit instead"
-            fi
-            unzip -oq "$RUNNER_TEMP/overlay.zip" -x '.github/workflows/*'
-            echo "Glasswork overlay applied"
-          else
-            echo "::warning::glasswork-overlay.zip not found; building the repository as it is"
-          fi
+          unzip -oq self/glasswork-overlay.zip -x '.github/workflows/*'
+          chmod +x ci/*.sh
+          echo "Glasswork overlay applied"
       - name: Gate - only continue if the core stage finished
         id: gate
         shell: bash
@@ -211,23 +200,18 @@ jobs:
     runs-on: ${{ matrix.a.runner }}
     timeout-minutes: 345
     steps:
-      - uses: actions/checkout@v7
-        with: { fetch-depth: 0, submodules: recursive }
+      - name: Get LMMS source (pinned commit)
+        uses: actions/checkout@v7
+        with: { repository: LMMS/lmms, ref: "${{ env.GLASSWORK_BASE }}", fetch-depth: 0, submodules: recursive }
+      - name: Get Glasswork overlay (this repo)
+        uses: actions/checkout@v7
+        with: { path: self, fetch-depth: 1 }
       - name: Apply Glasswork overlay
         shell: bash
         run: |
-          if [ -f glasswork-overlay.zip ]; then
-            cp glasswork-overlay.zip "$RUNNER_TEMP/overlay.zip"
-            if git cat-file -e "$GLASSWORK_BASE^{commit}" 2>/dev/null; then
-              git checkout -q "$GLASSWORK_BASE" && git submodule update --init --recursive -q
-            else
-              echo "::warning::pinned LMMS commit not found in this repo; building the current commit instead"
-            fi
-            unzip -oq "$RUNNER_TEMP/overlay.zip" -x '.github/workflows/*'
-            echo "Glasswork overlay applied"
-          else
-            echo "::warning::glasswork-overlay.zip not found; building the repository as it is"
-          fi
+          unzip -oq self/glasswork-overlay.zip -x '.github/workflows/*'
+          chmod +x ci/*.sh
+          echo "Glasswork overlay applied"
       - uses: ./.github/actions/prep
         with:
           arch: ${{ matrix.a.arch }}
