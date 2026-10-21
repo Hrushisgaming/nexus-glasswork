@@ -1,0 +1,321 @@
+name: build-macos
+# Sharded macOS build for an LMMS fork:
+# plan -> core -> plugin shards (parallel) -> package -> resume
+# Every stage fits well under GitHub's 6 h job limit and saves its progress even if it runs out of time.
+on:
+  workflow_dispatch:
+    inputs:
+      arch: { type: choice, options: [arm64, x86_64, both], default: arm64, description: "Which Mac CPU to build for" }
+      shards: { default: "4", description: "Plugin shards per arch (1-16)" }
+      budget_minutes: { default: "300", description: "Build time budget per job; job hard limit is 345 min" }
+      round: { default: "1", description: "Auto-resume round (set by the workflow)" }
+      max_rounds: { default: "3", description: "How many auto-resume rounds to allow" }
+      runner_arm64: { default: "macos-15", description: "Runner label for arm64" }
+      runner_x86_64: { default: "macos-15-intel", description: "Runner label for x86_64" }
+      runner_arm64_fallback: { default: "macos-14", description: "Used if the primary runner fails to start" }
+      runner_x86_64_fallback: { default: "macos-15-intel", description: "Used if the primary runner fails to start" }
+      use_fallback_runner: { type: boolean, default: false, description: "Use the fallback runner labels (set by the workflow)" }
+      cache_mode: { type: choice, options: [auto, cold], default: auto, description: "cold = ignore all caches" }
+      glasswork_plugins: { type: choice, options: ["on", "off"], default: "on", description: "off = safe mode: build without Glasswork's own plugins" }
+  push:
+    branches: [master, main]
+    paths: ["glasswork-overlay.zip"]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  WORKFLOW_FILE: build-macos.yml
+  GLASSWORK: ${{ inputs.glasswork_plugins || 'on' }}
+  GLASSWORK_BASE: 4fde529fb37115c327daadac8506870e92724f3a
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      archs: ${{ steps.p.outputs.archs }}
+      shards: ${{ steps.p.outputs.shards }}
+      nshards: ${{ steps.p.outputs.nshards }}
+      budget: ${{ steps.p.outputs.budget }}
+      round: ${{ steps.p.outputs.round }}
+    steps:
+      - id: p
+        shell: bash
+        env:
+          ARCH_IN: ${{ inputs.arch }}
+          SHARDS_IN: ${{ inputs.shards }}
+          BUDGET_IN: ${{ inputs.budget_minutes }}
+          ROUND_IN: ${{ inputs.round }}
+          RUNNER_ARM: ${{ inputs.runner_arm64 }}
+          RUNNER_X86: ${{ inputs.runner_x86_64 }}
+          FB_ARM: ${{ inputs.runner_arm64_fallback }}
+          FB_X86: ${{ inputs.runner_x86_64_fallback }}
+          USE_FB: ${{ inputs.use_fallback_runner }}
+        run: |
+          set -euo pipefail
+          arch="${ARCH_IN:-arm64}"; n="${SHARDS_IN:-4}"; budget="${BUDGET_IN:-300}"; round="${ROUND_IN:-1}"
+          r_arm="${RUNNER_ARM:-macos-15}"; r_x86="${RUNNER_X86:-macos-15-intel}"
+          if [ "${USE_FB:-false}" = "true" ]; then r_arm="${FB_ARM:-macos-14}"; r_x86="${FB_X86:-macos-15-intel}"; fi
+          for v in "$n" "$budget" "$round"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "bad number: $v"; exit 1; }; done
+          for v in "$r_arm" "$r_x86"; do [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad runner label: $v"; exit 1; }; done
+          (( n >= 1 && n <= 16 )) || { echo "shards must be 1-16"; exit 1; }
+          (( budget <= 330 )) || { echo "budget_minutes must be <= 330"; exit 1; }
+          items=()
+          if [ "$arch" = arm64 ] || [ "$arch" = both ]; then items+=("{\"arch\":\"arm64\",\"runner\":\"$r_arm\",\"target\":\"11.0\"}"); fi
+          if [ "$arch" = x86_64 ] || [ "$arch" = both ]; then items+=("{\"arch\":\"x86_64\",\"runner\":\"$r_x86\",\"target\":\"10.15\"}"); fi
+          echo "archs=[$(IFS=,; echo "${items[*]}")]" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq 0 $((n - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+          echo "nshards=$n" >> "$GITHUB_OUTPUT"
+          echo "budget=$budget" >> "$GITHUB_OUTPUT"
+          echo "round=$round" >> "$GITHUB_OUTPUT"
+
+  core:
+    needs: plan
+    name: core (${{ matrix.a.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        a: ${{ fromJSON(needs.plan.outputs.archs) }}
+    runs-on: ${{ matrix.a.runner }}
+    timeout-minutes: 345
+    steps:
+      - name: Get LMMS source (pinned commit)
+        uses: actions/checkout@v7
+        with: { repository: LMMS/lmms, ref: "${{ env.GLASSWORK_BASE }}", fetch-depth: 0, submodules: recursive }
+      - name: Get Glasswork overlay (this repo)
+        uses: actions/checkout@v7
+        with: { path: self, fetch-depth: 1 }
+      - name: Apply Glasswork overlay
+        shell: bash
+        run: |
+          unzip -oq self/glasswork-overlay.zip -x '.github/workflows/*'
+          chmod +x ci/*.sh
+          echo "Glasswork overlay applied"
+      - uses: ./.github/actions/prep
+        with:
+          arch: ${{ matrix.a.arch }}
+          target_os: ${{ matrix.a.target }}
+          cache_mode: ${{ inputs.cache_mode || 'auto' }}
+      - name: Build core
+        shell: bash
+        run: |
+          echo lmms > "$RUNNER_TEMP/core.list"
+          ci/build.sh build "$RUNNER_TEMP/core.list" "${{ needs.plan.outputs.budget }}" status/status.txt
+      - name: Pack cache delta
+        if: always()
+        shell: bash
+        run: ci/cache.sh delta-pack ccache-delta "$CCACHE_DIR" "$RUNNER_TEMP/cache-marker" out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: "delta-${{ matrix.a.arch }}-core", path: out/, if-no-files-found: ignore, retention-days: 3 }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: "status-${{ matrix.a.arch }}-core", path: status/status.txt, if-no-files-found: ignore, retention-days: 3 }
+
+  shards:
+    needs: [plan, core]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    name: shard ${{ matrix.shard }} (${{ matrix.a.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        a: ${{ fromJSON(needs.plan.outputs.archs) }}
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    runs-on: ${{ matrix.a.runner }}
+    timeout-minutes: 345
+    steps:
+      - name: Get LMMS source (pinned commit)
+        uses: actions/checkout@v7
+        with: { repository: LMMS/lmms, ref: "${{ env.GLASSWORK_BASE }}", fetch-depth: 0, submodules: recursive }
+      - name: Get Glasswork overlay (this repo)
+        uses: actions/checkout@v7
+        with: { path: self, fetch-depth: 1 }
+      - name: Apply Glasswork overlay
+        shell: bash
+        run: |
+          unzip -oq self/glasswork-overlay.zip -x '.github/workflows/*'
+          chmod +x ci/*.sh
+          echo "Glasswork overlay applied"
+      - name: Gate - only continue if the core stage finished
+        id: gate
+        shell: bash
+        run: |
+          mkdir -p s
+          if gh run download "$GITHUB_RUN_ID" -n "status-${{ matrix.a.arch }}-core" -D s >/dev/null 2>&1 && grep -q '^complete' s/status.txt; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"; echo "::warning::core stage incomplete; skipping shard ${{ matrix.shard }}"
+          fi
+      - uses: ./.github/actions/prep
+        if: steps.gate.outputs.go == 'true'
+        with:
+          arch: ${{ matrix.a.arch }}
+          target_os: ${{ matrix.a.target }}
+          cache_mode: ${{ inputs.cache_mode || 'auto' }}
+      - name: Overlay the core stage's cache
+        if: steps.gate.outputs.go == 'true'
+        shell: bash
+        run: |
+          mkdir -p deltas
+          gh run download "$GITHUB_RUN_ID" -n "delta-${{ matrix.a.arch }}-core" -D deltas >/dev/null 2>&1 || true
+          ci/cache.sh merge-deltas deltas "$CCACHE_DIR"
+          touch "$RUNNER_TEMP/cache-marker"
+      - name: Build this shard
+        if: steps.gate.outputs.go == 'true'
+        shell: bash
+        run: |
+          ci/build.sh shard "${{ matrix.shard }}" "${{ needs.plan.outputs.nshards }}" > "$RUNNER_TEMP/shard.list"
+          echo "targets in shard: $(wc -l < "$RUNNER_TEMP/shard.list")"
+          ci/build.sh build "$RUNNER_TEMP/shard.list" "${{ needs.plan.outputs.budget }}" status/status.txt
+      - name: Pack cache delta
+        if: always() && steps.gate.outputs.go == 'true'
+        shell: bash
+        run: ci/cache.sh delta-pack ccache-delta "$CCACHE_DIR" "$RUNNER_TEMP/cache-marker" out
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.gate.outputs.go == 'true'
+        with: { name: "delta-${{ matrix.a.arch }}-shard${{ matrix.shard }}", path: out/, if-no-files-found: ignore, retention-days: 3 }
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.gate.outputs.go == 'true'
+        with: { name: "status-${{ matrix.a.arch }}-shard${{ matrix.shard }}", path: status/status.txt, if-no-files-found: ignore, retention-days: 3 }
+
+  package:
+    needs: [plan, core, shards]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    name: package (${{ matrix.a.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        a: ${{ fromJSON(needs.plan.outputs.archs) }}
+    runs-on: ${{ matrix.a.runner }}
+    timeout-minutes: 345
+    steps:
+      - name: Get LMMS source (pinned commit)
+        uses: actions/checkout@v7
+        with: { repository: LMMS/lmms, ref: "${{ env.GLASSWORK_BASE }}", fetch-depth: 0, submodules: recursive }
+      - name: Get Glasswork overlay (this repo)
+        uses: actions/checkout@v7
+        with: { path: self, fetch-depth: 1 }
+      - name: Apply Glasswork overlay
+        shell: bash
+        run: |
+          unzip -oq self/glasswork-overlay.zip -x '.github/workflows/*'
+          chmod +x ci/*.sh
+          echo "Glasswork overlay applied"
+      - uses: ./.github/actions/prep
+        with:
+          arch: ${{ matrix.a.arch }}
+          target_os: ${{ matrix.a.target }}
+          cache_mode: ${{ inputs.cache_mode || 'auto' }}
+      - name: Download all stage artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+        continue-on-error: true
+      - name: Merge deltas, full build, package
+        shell: bash
+        env:
+          NSHARDS: ${{ needs.plan.outputs.nshards }}
+          BUDGET: ${{ needs.plan.outputs.budget }}
+        run: ci/package-stage.sh
+
+      - name: Upload .dmg artifact
+        id: up
+        if: always() && hashFiles('dist/*.dmg') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with: { name: "lmms-${{ matrix.a.arch }}-dmg", path: dist/*.dmg, retention-days: 30 }
+      - name: Fallback - attach .dmg to a prerelease
+        if: always() && steps.up.outcome == 'failure'
+        shell: bash
+        run: |
+          tag="dmg-${GITHUB_RUN_ID}-${{ matrix.a.arch }}"
+          gh release create "$tag" dist/*.dmg --prerelease --title "$tag" --notes "Fallback upload (artifact upload failed)."
+
+      - name: Trim ccache
+        if: always()
+        shell: bash
+        run: ccache --cleanup || true
+      - name: "L1 save: ccache"
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          key: ccache-${{ matrix.a.arch }}-${{ github.run_id }}-${{ github.run_attempt }}-r${{ needs.plan.outputs.round }}
+          path: ~/Library/Caches/ccache
+      - name: "L1 save: Homebrew downloads"
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          key: homebrew-${{ matrix.a.arch }}-${{ hashFiles('Brewfile') }}
+          path: ~/Library/Caches/Homebrew/downloads
+      - name: "L2 save: release tarball"
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: ci/cache.sh release-save "ccache-${{ matrix.a.arch }}" "$CCACHE_DIR"
+      - name: "L3 pack: merged artifact"
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          source ci/common.sh
+          tar_pack "merged/ccache-${{ matrix.a.arch }}.$(ext)" "$CCACHE_DIR"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with: { name: "ccache-${{ matrix.a.arch }}-merged", path: merged/, if-no-files-found: ignore, retention-days: 14 }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: "result-${{ matrix.a.arch }}", path: result/result.txt, if-no-files-found: ignore, retention-days: 3 }
+
+  resume:
+    needs: [plan, package]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Continue if out of time, or retry on the fallback runner if a Mac never started
+        shell: bash
+        env:
+          ROUND: ${{ needs.plan.outputs.round }}
+          MAX: ${{ inputs.max_rounds || '3' }}
+          NARCH: ${{ fromJSON(needs.plan.outputs.archs)[1] && 2 || 1 }}
+          USED_FB: ${{ inputs.use_fallback_runner || 'false' }}
+          ARCH_IN: ${{ inputs.arch || 'arm64' }}
+          SHARDS: ${{ needs.plan.outputs.nshards }}
+          BUDGET: ${{ needs.plan.outputs.budget }}
+          R_ARM: ${{ inputs.runner_arm64 || 'macos-15' }}
+          R_X86: ${{ inputs.runner_x86_64 || 'macos-15-intel' }}
+          FB_ARM: ${{ inputs.runner_arm64_fallback || 'macos-14' }}
+          FB_X86: ${{ inputs.runner_x86_64_fallback || 'macos-15-intel' }}
+          GW_MODE: ${{ inputs.glasswork_plugins || 'on' }}
+        run: |
+          set -euo pipefail
+          mkdir -p r; gh run download "$GITHUB_RUN_ID" -p 'result-*' -D r >/dev/null 2>&1 || true
+          results="$(cat r/*/result.txt 2>/dev/null || true)"
+          got="$(printf '%s\n' "$results" | grep -c . || true)"
+          echo "results: $(echo $results) (expected $NARCH)"
+          dispatch() {
+            gh workflow run "$WORKFLOW_FILE" --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+              -f arch="$ARCH_IN" -f shards="$SHARDS" -f budget_minutes="$BUDGET" -f round="$1" -f max_rounds="$MAX" \
+              -f runner_arm64="$R_ARM" -f runner_x86_64="$R_X86" \
+              -f runner_arm64_fallback="$FB_ARM" -f runner_x86_64_fallback="$FB_X86" \
+              -f use_fallback_runner="$2" -f cache_mode=auto -f glasswork_plugins="${3:-$GW_MODE}"
+          }
+          if printf '%s\n' "$results" | grep -q '^partial$' && (( ROUND < MAX )); then
+            echo "Out of time budget; resuming as round $((ROUND + 1))"; dispatch "$((ROUND + 1))" "$USED_FB"
+          elif (( got < NARCH )) && [ "$USED_FB" != "true" ]; then
+            echo "A package job never reported (runner problem?); retrying once on the fallback runner"; dispatch "$ROUND" true
+          elif printf '%s\n' "$results" | grep -q '^failed$' && [ "$GW_MODE" = "on" ]; then
+            echo "A build stage failed with Glasswork's plugins on; retrying once in safe mode without them"; dispatch "$ROUND" "$USED_FB" off
+          elif printf '%s\n' "$results" | grep -q '^failed$'; then
+            echo "::error::A build stage failed. Open the failed job's log; the cache was still saved."; exit 1
+          fi
